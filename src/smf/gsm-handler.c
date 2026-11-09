@@ -26,6 +26,111 @@
 #undef OGS_LOG_DOMAIN
 #define OGS_LOG_DOMAIN __gsm_log_domain
 
+#define QOS_FLOW_DESCRIPTION_MIN_LEN 3
+
+uint8_t *gsm_decode_base64(const char *src, int *out_len)
+{
+    int len, decoded;
+    uint8_t *buf = NULL;
+
+    ogs_assert(out_len);
+
+    *out_len = 0;
+
+    if (!src) {
+        ogs_error("No base64 data");
+        return NULL;
+    }
+
+    len = ogs_base64_decoded_size(src);
+    if (len <= 0) {
+        ogs_error("Invalid base64 data");
+        return NULL;
+    }
+
+    buf = ogs_calloc(1, len);
+    if (!buf) {
+        ogs_error("ogs_calloc() failed [%d]", len);
+        return NULL;
+    }
+
+    decoded = ogs_base64_decode_to_buffer(buf, len, src);
+    if (decoded <= 0) {
+        ogs_error("Invalid base64 data");
+        ogs_free(buf);
+        return NULL;
+    }
+    if (decoded > 0xffff) {
+        ogs_error("Base64 data too long [%d]", decoded);
+        ogs_free(buf);
+        return NULL;
+    }
+
+    *out_len = decoded;
+
+    return buf;
+}
+
+uint8_t *gsm_decode_qos_flow_description_ie(const char *src, int *len)
+{
+    int value_len;
+    uint8_t *buf = gsm_decode_base64(src, len);
+
+    if (!buf)
+        return NULL;
+
+    if (*len < GSM_QOS_FLOW_DESCRIPTION_IE_HEADER_LEN +
+                   QOS_FLOW_DESCRIPTION_MIN_LEN ||
+        buf[0] != GSM_QOS_FLOW_DESCRIPTION_IEI)
+        goto invalid;
+
+    value_len = (buf[1] << 8) | buf[2];
+    if (value_len != *len - GSM_QOS_FLOW_DESCRIPTION_IE_HEADER_LEN)
+        goto invalid;
+
+    memmove(buf, buf + GSM_QOS_FLOW_DESCRIPTION_IE_HEADER_LEN, value_len);
+    *len = value_len;
+    return buf;
+
+invalid:
+    ogs_free(buf);
+    *len = 0;
+    return NULL;
+}
+
+bool gsm_qos_flow_description_ie_is_valid(const char *src)
+{
+    int len;
+    uint8_t *buf = gsm_decode_qos_flow_description_ie(src, &len);
+
+    if (!buf)
+        return false;
+
+    ogs_free(buf);
+    return true;
+}
+
+int gsm_parse_qos_flow_description_ie(
+        ogs_nas_qos_flow_description_t *description, const char *src)
+{
+    ogs_nas_qos_flow_descriptions_t descriptions;
+    ogs_nas_qos_flow_description_t parsed[OGS_NAS_MAX_NUM_OF_QOS_FLOW_DESCRIPTION];
+    int len, count;
+
+    descriptions.buffer = gsm_decode_qos_flow_description_ie(src, &len);
+    if (!descriptions.buffer)
+        return OGS_ERROR;
+
+    descriptions.length = len;
+    count = ogs_nas_parse_qos_flow_descriptions(parsed, &descriptions);
+    ogs_free(descriptions.buffer);
+    if (count != 1)
+        return OGS_ERROR;
+
+    *description = parsed[0];
+    return OGS_OK;
+}
+
 int gsm_handle_pdu_session_establishment_request(
         smf_sess_t *sess, ogs_sbi_stream_t *stream,
         ogs_nas_5gs_pdu_session_establishment_request_t *
@@ -257,6 +362,16 @@ int gsm_handle_pdu_session_modification_qos_rules(
         ogs_list_init(&qos_flow->pf_to_add_list);
 
         if (qos_rule[i].code == OGS_NAS_QOS_CODE_DELETE_EXISTING_QOS_RULE) {
+            /*
+             * Keep the default QoS flow for the PDU session lifetime.
+             * Use the stored flow rather than the UE-provided DQR bit.
+             */
+            if (qos_flow == smf_default_bearer_in_sess(sess)) {
+                ogs_error("[%s:%d] Cannot delete default QoS rule [QRI/QFI:%d]",
+                        smf_ue->supi, sess->psi, qos_rule[i].identifier);
+                return OGS_ERROR;
+            }
+
             smf_pf_remove_all(qos_flow);
 
             *pfcp_flags |= OGS_PFCP_MODIFY_REMOVE;
@@ -276,8 +391,22 @@ int gsm_handle_pdu_session_modification_qos_rules(
             for (j = 0; j < qos_rule[i].num_of_packet_filter &&
                         j < OGS_MAX_NUM_OF_FLOW_IN_NAS; j++) {
 
+                /*
+                 * The per-flow packet filter pool is limited to
+                 * OGS_MAX_NUM_OF_FLOW_IN_BEARER, but the UE can keep adding
+                 * packet filters to the same QoS flow -- either with several
+                 * rules in one request or with repeated requests -- since
+                 * "modify existing QoS rule and add packet filters" does not
+                 * remove the previous ones. Exhausting the pool is therefore
+                 * UE input, not an internal error: reject the request.
+                 */
                 pf = smf_pf_add(qos_flow);
-                ogs_assert(pf);
+                if (!pf) {
+                    ogs_error("[%s:%d] Overflow: PacketFilter in QoS flow "
+                            "[QRI/QFI:%d]",
+                            smf_ue->supi, sess->psi, qos_rule[i].identifier);
+                    return OGS_ERROR;
+                }
 
                 if (reconfigure_packet_filter(pf, &qos_rule[i], j) <= 0) {
                     ogs_error("[%s:%d] Invalid packet filter",
@@ -325,11 +454,16 @@ int gsm_handle_pdu_session_modification_qos_rules(
                     ogs_ipfw_copy_and_swap(&tmp, &pf->ipfw_rule);
                     pf->flow_description =
                         ogs_ipfw_encode_flow_description(&tmp);
-                    ogs_assert(pf->flow_description);
                 } else {
                     pf->flow_description =
                         ogs_ipfw_encode_flow_description(&pf->ipfw_rule);
-                    ogs_assert(pf->flow_description);
+                }
+
+                if (!pf->flow_description) {
+                    ogs_error("[%s:%d] Invalid packet filter [pf-direction=%d]",
+                            smf_ue->supi, sess->psi, pf->direction);
+                    smf_pf_remove(pf);
+                    return OGS_ERROR;
                 }
 
                 if (qos_rule[i].code ==
@@ -608,7 +742,7 @@ int gsm_handle_pdu_session_modification_request(
                     "[REMOVE combined with TFT/QOS-MODIFY "
                     "pfcp_flags:0x%llx]",
                     smf_ue->supi, sess->psi, (long long)pfcp_flags);
-            ogs_assert_if_reached();
+            goto cleanup;
         }
 
     } else if (pfcp_flags &

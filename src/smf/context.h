@@ -297,6 +297,10 @@ typedef struct smf_sess_s {
 
     ogs_fsm_t       sm;             /* A state machine */
     struct {
+        bool epc_auth_aborted; /* GTP transaction lost; drain pending answers */
+        bool gx_session_created; /* Successful Gx Initial answer */
+        bool gy_session_created; /* Outer Gy success, including MSCC failure */
+        bool s6b_session_created; /* Successful S6b AAA */
         bool gx_ccr_init_in_flight; /* Waiting for Gx CCA */
         uint32_t gx_cca_init_err; /* Gx CCA RXed error code */
         bool gy_ccr_init_in_flight; /* Waiting for Gy CCA */
@@ -644,6 +648,15 @@ typedef struct smf_sess_s {
         bool prepared;
         bool data_forwarding_not_possible;
         bool indirect_data_forwarding;
+
+        /*
+         * Delayed PFCP REMOVE of the indirect tunnel after handover
+         * completion. The next handover reuses it as the first step of
+         * replacing the tunnel (ngap_handle_handover_request_ack).
+         * Cleared when that transaction is claimed, answered or timed out,
+         * so it never refers to a transaction that no longer exists.
+         */
+        ogs_pool_id_t indirect_remove_xact_id;
 
         /* NG-U UP Transport Information Saved Temporally */
         uint32_t gnb_n3_teid;

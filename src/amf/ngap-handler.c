@@ -838,6 +838,16 @@ void ngap_handle_initial_ue_message(amf_gnb_t *gnb, ogs_ngap_message_t *message)
      * or associate this RAN UE with the AMF UE.
      */
     if (amf_ue) {
+        if (amf_ue->registration_session_release_pending) {
+            ogs_error("[%s] Ignore new NG context while registration session "
+                    "release is pending", amf_ue->supi);
+            r = ngap_send_ran_ue_context_release_command(ran_ue,
+                    NGAP_Cause_PR_nas, NGAP_CauseNas_normal_release,
+                    NGAP_UE_CTX_REL_NG_CONTEXT_REMOVE, 0);
+            ogs_expect(r == OGS_OK);
+            ogs_assert(r != OGS_ERROR);
+            return;
+        }
         /* If NAS(amf_ue_t) has already been associated with
          * older NG(ran_ue_t) context */
         if (CM_CONNECTED(amf_ue)) {
@@ -1071,7 +1081,7 @@ void ngap_handle_ue_radio_capability_info_indication(
         amf_gnb_t *gnb, ogs_ngap_message_t *message)
 {
     char buf[OGS_ADDRSTRLEN];
-    int i, r;
+    int i;
 
     ran_ue_t *ran_ue = NULL;
     amf_ue_t *amf_ue = NULL;
@@ -1128,13 +1138,12 @@ void ngap_handle_ue_radio_capability_info_indication(
             (long long)ran_ue->ran_ue_ngap_id,
             (long long)ran_ue->amf_ue_ngap_id);
 
+    /*
+     * TS 38.413 9.2.13.1 and 10.3.5: UE Radio Capability has assigned
+     * criticality "ignore"; ignore its absence without notifying the sender.
+     */
     if (!UERadioCapability) {
-        ogs_error("No UERadioCapability");
-        r = ngap_send_error_indication(
-                gnb, &ran_ue->ran_ue_ngap_id, &ran_ue->amf_ue_ngap_id,
-                NGAP_Cause_PR_protocol, NGAP_CauseProtocol_semantic_error);
-        ogs_expect(r == OGS_OK);
-        ogs_assert(r != OGS_ERROR);
+        ogs_error("No UERadioCapability IE; ignoring the indication");
         return;
     }
 
@@ -2080,6 +2089,7 @@ void ngap_handle_ue_context_release_action(ran_ue_t *ran_ue)
     switch (ran_ue->ue_ctx_rel_action) {
     case NGAP_UE_CTX_REL_NG_CONTEXT_REMOVE:
         ogs_debug("    Action: NG context remove");
+        amf_sbi_send_deactivate_stale_user_plane(ran_ue);
         ran_ue_remove(ran_ue);
         break;
     case NGAP_UE_CTX_REL_NG_REMOVE_AND_UNLINK:
@@ -3099,12 +3109,23 @@ void ngap_handle_path_switch_request(
         return;
     }
 
+    if (!PDUSessionResourceToBeSwitchedDLList) {
+        ogs_error("No PDUSessionResourceToBeSwitchedDLList");
+        r = ngap_send_error_indication(gnb,
+                (uint64_t *)RAN_UE_NGAP_ID, &amf_ue_ngap_id,
+                NGAP_Cause_PR_protocol, NGAP_CauseProtocol_semantic_error);
+        ogs_expect(r == OGS_OK);
+        ogs_assert(r != OGS_ERROR);
+        return;
+    }
+
     ran_ue = ran_ue_find_by_amf_ue_ngap_id(amf_ue_ngap_id);
     if (!ran_ue) {
         ogs_error("No RAN UE Context : AMF_UE_NGAP_ID[%lld]",
                 (long long)amf_ue_ngap_id);
-        r = ngap_send_error_indication(
-                gnb, (uint64_t *)RAN_UE_NGAP_ID, &amf_ue_ngap_id,
+        r = ngap_send_path_switch_failure(
+                gnb, *RAN_UE_NGAP_ID, amf_ue_ngap_id,
+                PDUSessionResourceToBeSwitchedDLList,
                 NGAP_Cause_PR_radioNetwork,
                 NGAP_CauseRadioNetwork_unknown_local_UE_NGAP_ID);
         ogs_expect(r == OGS_OK);
@@ -3116,10 +3137,36 @@ void ngap_handle_path_switch_request(
     if (!amf_ue) {
         ogs_error("Cannot find AMF-UE Context [%lld]",
                 (long long)amf_ue_ngap_id);
-        r = ngap_send_error_indication(
-                gnb, &ran_ue->ran_ue_ngap_id, &ran_ue->amf_ue_ngap_id,
+        r = ngap_send_path_switch_failure(
+                gnb, *RAN_UE_NGAP_ID, amf_ue_ngap_id,
+                PDUSessionResourceToBeSwitchedDLList,
                 NGAP_Cause_PR_radioNetwork,
                 NGAP_CauseRadioNetwork_unknown_local_UE_NGAP_ID);
+        ogs_expect(r == OGS_OK);
+        ogs_assert(r != OGS_ERROR);
+        return;
+    }
+
+    /*
+     * When the NG association of the source gNB is lost,
+     * amf_gnb_remove() frees the gNB at once, but ran_ue stays
+     * until the SMF confirms the user-plane deactivation started by
+     * amf_sbi_send_deactivate_all_ue_in_gnb(). A PathSwitchRequest
+     * arriving in this window refers to an NG context that is being
+     * released, so it is not switched to the target gNB.
+     * ran_ue_switch_to_gnb() also requires the source gNB.
+     */
+    if (!amf_gnb_find_by_id(ran_ue->gnb_id)) {
+        ogs_error("[%d] gNB has already been removed : "
+                "RAN_UE_NGAP_ID[%lld] AMF_UE_NGAP_ID[%lld]",
+                ran_ue->gnb_id,
+                (long long)ran_ue->ran_ue_ngap_id,
+                (long long)ran_ue->amf_ue_ngap_id);
+        r = ngap_send_path_switch_failure(
+                gnb, *RAN_UE_NGAP_ID, amf_ue_ngap_id,
+                PDUSessionResourceToBeSwitchedDLList,
+                NGAP_Cause_PR_protocol,
+                NGAP_CauseProtocol_message_not_compatible_with_receiver_state);
         ogs_expect(r == OGS_OK);
         ogs_assert(r != OGS_ERROR);
         return;
@@ -3165,20 +3212,11 @@ void ngap_handle_path_switch_request(
         return;
     }
 
-    if (!PDUSessionResourceToBeSwitchedDLList) {
-        ogs_error("No PDUSessionResourceToBeSwitchedDLList");
-        r = ngap_send_error_indication(gnb,
-                (uint64_t *)RAN_UE_NGAP_ID, &amf_ue_ngap_id,
-                NGAP_Cause_PR_protocol, NGAP_CauseProtocol_semantic_error);
-        ogs_expect(r == OGS_OK);
-        ogs_assert(r != OGS_ERROR);
-        return;
-    }
-
     if (!SECURITY_CONTEXT_IS_VALID(amf_ue)) {
         ogs_error("No Security Context");
-        r = ngap_send_error_indication(gnb,
-                (uint64_t *)RAN_UE_NGAP_ID, &amf_ue_ngap_id,
+        r = ngap_send_path_switch_failure(
+                gnb, *RAN_UE_NGAP_ID, amf_ue_ngap_id,
+                PDUSessionResourceToBeSwitchedDLList,
                 NGAP_Cause_PR_nas, NGAP_CauseNas_authentication_failure);
         ogs_expect(r == OGS_OK);
         ogs_assert(r != OGS_ERROR);
@@ -3702,6 +3740,8 @@ void ngap_handle_handover_required(
         ogs_assert(r != OGS_ERROR);
         return;
     }
+
+    amf_ue->ho_attempted++;
 
     target_ue = ran_ue_find_by_id(source_ue->target_ue_id);
     if (target_ue) {
@@ -4274,6 +4314,11 @@ void ngap_handle_handover_failure(
     ogs_debug("    Cause[Group:%d Cause:%d]",
             Cause->present, (int)Cause->choice.radioNetwork);
 
+    if (source_ue->amf_ue_id != OGS_INVALID_POOL_ID) {
+        amf_ue_t *failed_ue = amf_ue_find_by_id(source_ue->amf_ue_id);
+        if (failed_ue) failed_ue->ho_rejected++;
+    }
+
     r = ngap_send_handover_preparation_failure(source_ue, Cause);
     ogs_expect(r == OGS_OK);
     ogs_assert(r != OGS_ERROR);
@@ -4405,6 +4450,7 @@ void ngap_handle_handover_cancel(
         return;
     }
     amf_ue = amf_ue_find_by_id(source_ue->amf_ue_id);
+    if (amf_ue) amf_ue->ho_rejected++;
     if (!amf_ue) {
         ogs_error("Cannot find AMF-UE Context [%lld]",
                 (long long)amf_ue_ngap_id);
@@ -4801,6 +4847,8 @@ void ngap_handle_handover_notification(
     ogs_debug("    Target : TAC[%d] CellID[0x%llx]",
         target_ue->saved.nr_tai.tac.v,
         (long long)target_ue->saved.nr_cgi.cell_id);
+
+    amf_ue->ho_completed++;
 
     /* Copy Stream-No/TAI/ECGI from ran_ue */
     amf_ue->gnb_ostream_id = target_ue->gnb_ostream_id;
@@ -5401,7 +5449,10 @@ void ngap_handle_ng_reset(
                             (long long)ran_ue->ran_ue_ngap_id);
             }
 
-            if (old_xact_count == new_xact_count) ran_ue_remove(ran_ue);
+            if (old_xact_count == new_xact_count) {
+                amf_sbi_send_deactivate_stale_user_plane(ran_ue);
+                ran_ue_remove(ran_ue);
+            }
         }
 
         ogs_list_for_each(&gnb->ran_ue_list, iter) {
@@ -5573,6 +5624,8 @@ void ngap_handle_error_indication(amf_gnb_t *gnb, ogs_ngap_message_t *message)
                             amf_self()->time.t3512.value + 240));
             }
         } else {
+            /* A held NG context: no AMF-UE is associated with it */
+            amf_sbi_send_deactivate_stale_user_plane(ran_ue);
             ran_ue_remove(ran_ue);
         }
     }

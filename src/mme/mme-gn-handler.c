@@ -183,7 +183,14 @@ void mme_gn_handle_sgsn_context_request(
 
     if (req->imsi.presence) {
         char imsi_bcd[OGS_MAX_IMSI_BCD_LEN+1];
-        ogs_buffer_to_bcd(req->imsi.data, req->imsi.len, imsi_bcd);
+        if (!ogs_buffer_to_bcd(req->imsi.data, req->imsi.len,
+                    imsi_bcd, sizeof(imsi_bcd))) {
+            ogs_warn("[Gn] Rx SGSN Context Request with invalid IMSI "
+                    "[len:%d]!", req->imsi.len);
+            mme_gtp1_send_sgsn_context_response(
+                    NULL, OGS_GTP1_CAUSE_MANDATORY_IE_INCORRECT, xact);
+            return;
+        }
         ogs_debug("    IMSI[%s]", imsi_bcd);
         mme_ue = mme_ue_find_by_imsi(req->imsi.data, req->imsi.len);
         if (!mme_ue)
@@ -280,7 +287,9 @@ static mme_sess_t *mme_ue_session_from_gtp1_pdp_ctx(mme_ue_t *mme_ue, const ogs_
         ogs_assert(sess);
     }
 
-    sess->session = ogs_sess;
+    mme_sess_set_session(sess, ogs_sess);
+    if (!sess->session->session_type)
+        sess->session->session_type = gtp1_pdp_ctx->pdp_type_num[0];
     sess->pgw_s5c_teid = gtp1_pdp_ctx->ul_teic;
     sess->pgw_s5c_ip = gtp1_pdp_ctx->ggsn_address_c;
     ogs_ip_to_paa(&gtp1_pdp_ctx->pdp_address[0], &sess->paa);
@@ -379,7 +388,13 @@ int mme_gn_handle_sgsn_context_response(
         goto nack_and_reject;
     }
 
-    ogs_buffer_to_bcd(resp->imsi.data, resp->imsi.len, imsi_bcd);
+    if (!ogs_buffer_to_bcd(resp->imsi.data, resp->imsi.len,
+                imsi_bcd, sizeof(imsi_bcd))) {
+        ogs_error("[Gn] Rx SGSN Context Response with invalid IMSI [len:%d]!",
+                resp->imsi.len);
+        gtp1_cause = OGS_GTP1_CAUSE_MANDATORY_IE_INCORRECT;
+        goto nack_and_reject;
+    }
     ogs_info("    IMSI[%s]", imsi_bcd);
     mme_ue_set_imsi(mme_ue, imsi_bcd,
             MME_UE_IMSI_FROM_SGSN_CONTEXT_RESPONSE);
@@ -432,6 +447,8 @@ int mme_gn_handle_sgsn_context_response(
              ogs_min(gtp1_mm_ctx.ms_network_capability_len, sizeof(mme_ue->ms_network_capability) - 1));
     /* TODO: how to fill first byte of mme_ue->ms_network_capability ? */
 
+    /* The KASME derived from the SGSN context is a mapped EPS context. */
+    mme_ue->nas_eps.mme.tsc = 1;
     mme_ue->nas_eps.mme.ksi = gtp1_mm_ctx.ksi;
     /* 3GPP TS 33.401 A.10, A.11: */
     mme_ue->noncemme = ogs_random32();

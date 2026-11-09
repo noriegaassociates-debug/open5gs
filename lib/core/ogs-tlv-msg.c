@@ -547,7 +547,7 @@ static int tlv_parse_leaf(void *msg, ogs_tlv_desc_t *desc, ogs_tlv_t *tlv)
             ogs_error("Invalid TLV length %d. It should be 4", tlv->length);
             return OGS_ERROR;
         }
-        v->u32 = ((((uint8_t*)tlv->value)[0]<<24)&0xff000000) |
+        v->u32 = (((uint32_t)((uint8_t*)tlv->value)[0]<<24)&0xff000000) |
                ((((uint8_t*)tlv->value)[1]<<16)&0x00ff0000) |
                ((((uint8_t*)tlv->value)[2]<< 8)&0x0000ff00) |
                ((((uint8_t*)tlv->value)[3]    )&0x000000ff);
@@ -812,6 +812,13 @@ static uint8_t *tlv_get_element_desc(ogs_tlv_t *tlv, uint8_t *blk,
     tlv_tag_pos = 0; /* All tags with same instance should use the same tlv_desc, so take the first one */
     tlv_desc = tlv_find_desc_by_type_inst(&desc_index, &tlv_offset, desc, tlv_tag, instance, tlv_tag_pos);
     if (!tlv_desc) {
+        /*
+         * TS 29.060 11.1.9: An unknown TLV IE (type >= 128) is skipped
+         * using its length. An unknown TV IE has no length to skip.
+         */
+        if (tlv_tag >= 128)
+            return tlv_get_element(tlv, blk, size, msg_mode);
+
         ogs_error("Can't parse find TLV description for type %u", tlv_tag);
         return NULL;
     }

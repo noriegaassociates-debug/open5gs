@@ -274,6 +274,10 @@ void smf_5gc_n4_handle_session_modification_response(
     ogs_assert(flags);
     trigger = xact->delete_trigger;
 
+    /* The delayed indirect tunnel REMOVE, if this is it, is done */
+    if (sess && sess->handover.indirect_remove_xact_id == xact->id)
+        sess->handover.indirect_remove_xact_id = OGS_INVALID_POOL_ID;
+
     /* 'stream' could be NULL in smf_qos_flow_binding() */
     if (xact->assoc_stream_id >= OGS_MIN_POOL_ID &&
             xact->assoc_stream_id <= OGS_MAX_POOL_ID)
@@ -620,10 +624,26 @@ void smf_5gc_n4_handle_session_modification_response(
                     sess->nsmf_param.request_indication =
                         OpenAPI_request_indication_UE_REQ_PDU_SES_REL;
 
+                    /*
+                     * The H-SMF release request can overtake its response
+                     * to this update. Store the AMF stream before sending
+                     * so PFCP deletion can complete the original request.
+                     */
+                    if (sess->amf_to_vsmf_release_stream_id >= OGS_MIN_POOL_ID &&
+                        sess->amf_to_vsmf_release_stream_id <= OGS_MAX_POOL_ID)
+                        ogs_error("UE requested release stream ID "
+                                "[%d] has not been used yet",
+                                sess->amf_to_vsmf_release_stream_id);
+                    sess->amf_to_vsmf_release_stream_id =
+                        stream ? ogs_sbi_id_from_stream(stream) :
+                            OGS_INVALID_POOL_ID;
+
                     r = smf_sbi_discover_and_send(
                             OpenAPI_service_name_nsmf_pdusession, NULL,
                             smf_nsmf_pdusession_build_hsmf_update_data,
                             sess, stream, trigger, NULL);
+                    if (r != OGS_OK)
+                        sess->amf_to_vsmf_release_stream_id = OGS_INVALID_POOL_ID;
                     ogs_expect(r == OGS_OK);
                     ogs_assert(r != OGS_ERROR);
                 } else if (trigger ==
@@ -799,6 +819,13 @@ void smf_5gc_n4_handle_session_modification_response(
                 OpenAPI_n2_sm_info_type_PATH_SWITCH_REQ_ACK, n2smbuf);
         } else if (flags & OGS_PFCP_MODIFY_N2_HANDOVER) {
 
+            /*
+             * The indirect tunnel is kept for handover.duration after
+             * completion so that packets already forwarded to it are
+             * not dropped. If the next handover starts before this
+             * delayed REMOVE is answered, it is reused as the first step
+             * of replacing the tunnel (ngap_handle_handover_request_ack).
+             */
             if (smf_sess_have_indirect_data_forwarding(sess) == true) {
                 ogs_assert(OGS_OK ==
                     smf_5gc_pfcp_send_all_pdr_modification_request(
@@ -853,13 +880,26 @@ void smf_5gc_n4_handle_session_modification_response(
      */
     } else if (flags & OGS_PFCP_MODIFY_REMOVE) {
         if (flags & OGS_PFCP_MODIFY_INDIRECT) {
-
+            /*
+             * Indirect tunnel PDR/FARs are only identified by
+             * ACCESS -> ACCESS, so a session holds one tunnel at a time
+             * and replacing it takes two PFCP round trips:
+             *
+             *   1. REMOVE the old tunnel (the request just answered)
+             *   2. CREATE the new tunnel (sent below)
+             *
+             * OGS_PFCP_MODIFY_CREATE in 'flags' marks that step 2 is still
+             * to do; smf_n4_build_pdr_to_modify_list() emitted only the
+             * Remove IEs for step 1. It is set by the caller sending
+             * REMOVE|CREATE, or added to the delayed REMOVE after handover
+             * completion when the next handover reuses it.
+             *
+             * REMOVE without CREATE is the delayed removal after handover
+             * completion or a handover cancel.
+             */
             smf_sess_delete_indirect_data_forwarding(sess);
 
-            /*
-             * OGS_PFCP_MODIFY_CREATE remains.
-             * So now we do some extra work to create an indirect tunnel.
-             */
+            /* Step 2 of the replacement */
             if (flags & OGS_PFCP_MODIFY_CREATE) {
                 smf_sess_create_indirect_data_forwarding(sess);
 
@@ -1367,7 +1407,11 @@ void smf_epc_n4_handle_session_modification_response(
     }
 
     if (flags & OGS_PFCP_MODIFY_REMOVE) {
-        ogs_assert(bearer);
+        /* A previous REMOVE response may have already removed this bearer. */
+        if (!bearer) {
+            ogs_error("Bearer has already been removed");
+            return;
+        }
         smf_bearer_remove(bearer);
 
     } else if (flags & OGS_PFCP_MODIFY_CREATE) {
@@ -1589,9 +1633,13 @@ uint8_t smf_epc_n4_handle_session_deletion_response(
     return OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
 }
 
-/* Returns OGS_PFCP_CAUSE_REQUEST_ACCEPTED on success,
- * other cause value on failure */
-uint8_t smf_n4_handle_session_report_request(
+/*
+ * Returns true when the report requires the session to be released
+ * (Gy Final-Unit-Indication or no Gy peer).  A malformed or otherwise
+ * rejected report is answered with an error response but never releases
+ * the session, so it returns false.
+ */
+bool smf_n4_handle_session_report_request(
         smf_sess_t *sess, ogs_pfcp_xact_t *pfcp_xact,
         ogs_pfcp_session_report_request_t *pfcp_req)
 {
@@ -1603,8 +1651,8 @@ uint8_t smf_n4_handle_session_report_request(
     ogs_pfcp_far_t *far = NULL;
 
     ogs_pfcp_report_type_t report_type;
-    uint8_t cause_value = 0;
     uint16_t pdr_id = 0;
+    bool release_session = false;
     unsigned int i;
 
     smf_metrics_inst_global_inc(SMF_METR_GLOB_CTR_SM_N4SESSIONREPORT);
@@ -1614,23 +1662,26 @@ uint8_t smf_n4_handle_session_report_request(
 
     ogs_debug("Session Report Request");
 
-    cause_value = OGS_PFCP_CAUSE_REQUEST_ACCEPTED;
-
+    /*
+     * pfcp-sm.c rejects a Session Report Request with no session before it
+     * reaches the FSM, so sess is always set here.  Keep the guard as a
+     * defensive check.
+     */
     if (!sess) {
         ogs_error("No Context");
-        cause_value = OGS_PFCP_CAUSE_SESSION_CONTEXT_NOT_FOUND;
+        ogs_pfcp_send_error_message(pfcp_xact, 0,
+                OGS_PFCP_SESSION_REPORT_RESPONSE_TYPE,
+                OGS_PFCP_CAUSE_SESSION_CONTEXT_NOT_FOUND, 0);
+        return false;
     }
 
     if (pfcp_req->report_type.presence == 0) {
         ogs_error("No Report Type");
-        cause_value = OGS_PFCP_CAUSE_MANDATORY_IE_MISSING;
-    }
-
-    if (cause_value != OGS_PFCP_CAUSE_REQUEST_ACCEPTED) {
         ogs_pfcp_send_error_message(pfcp_xact, 0,
                 OGS_PFCP_SESSION_REPORT_RESPONSE_TYPE,
-                cause_value, 0);
-        return cause_value;
+                OGS_PFCP_CAUSE_MANDATORY_IE_MISSING,
+                OGS_PFCP_REPORT_TYPE_TYPE);
+        return false;
     }
 
     ogs_assert(sess);
@@ -1670,7 +1721,7 @@ uint8_t smf_n4_handle_session_report_request(
                         ogs_pfcp_send_error_message(pfcp_xact, 0,
                                 OGS_PFCP_SESSION_REPORT_RESPONSE_TYPE,
                                 OGS_PFCP_CAUSE_SERVICE_NOT_SUPPORTED, 0);
-                        return OGS_PFCP_CAUSE_SERVICE_NOT_SUPPORTED;
+                        return false;
                     }
 
                     if (qfi) {
@@ -1680,7 +1731,7 @@ uint8_t smf_n4_handle_session_report_request(
                             ogs_pfcp_send_error_message(pfcp_xact, 0,
                                 OGS_PFCP_SESSION_REPORT_RESPONSE_TYPE,
                                 OGS_PFCP_CAUSE_SESSION_CONTEXT_NOT_FOUND, 0);
-                            return OGS_PFCP_CAUSE_SESSION_CONTEXT_NOT_FOUND;
+                            return false;
                         }
                     }
                 } else {
@@ -1689,23 +1740,37 @@ uint8_t smf_n4_handle_session_report_request(
             }
 
             if (pfcp_req->downlink_data_report.pdr_id.presence) {
-                pdr = ogs_pfcp_pdr_find(&sess->pfcp,
-                    pfcp_req->downlink_data_report.pdr_id.u16);
+                pdr_id = pfcp_req->downlink_data_report.pdr_id.u16;
+                pdr = ogs_pfcp_pdr_find(&sess->pfcp, pdr_id);
                 if (!pdr)
                     ogs_error("Cannot find the PDR-ID[%d]", pdr_id);
             } else {
                 ogs_error("No PDR-ID");
+                ogs_pfcp_send_error_message(pfcp_xact, 0,
+                        OGS_PFCP_SESSION_REPORT_RESPONSE_TYPE,
+                        OGS_PFCP_CAUSE_MANDATORY_IE_MISSING,
+                        OGS_PFCP_PDR_ID_TYPE);
+                return false;
             }
         } else {
+            /*
+             * TS 29.244 7.5.8.1: the Downlink Data Report IE is required
+             * when the Report Type indicates DLDR.
+             */
             ogs_error("No Downlink Data Report");
+            ogs_pfcp_send_error_message(pfcp_xact, 0,
+                    OGS_PFCP_SESSION_REPORT_RESPONSE_TYPE,
+                    OGS_PFCP_CAUSE_CONDITIONAL_IE_MISSING,
+                    OGS_PFCP_DOWNLINK_DATA_REPORT_TYPE);
+            return false;
         }
 
         if (!pdr) {
-            ogs_error("No Context");
+            ogs_error("Cannot find the PDR");
             ogs_pfcp_send_error_message(pfcp_xact, 0,
                     OGS_PFCP_SESSION_REPORT_RESPONSE_TYPE,
                     OGS_PFCP_CAUSE_SESSION_CONTEXT_NOT_FOUND, 0);
-            return OGS_PFCP_CAUSE_SESSION_CONTEXT_NOT_FOUND;
+            return false;
         }
 
         switch (sess->up_cnx_state) {
@@ -1791,13 +1856,12 @@ uint8_t smf_n4_handle_session_report_request(
             } else {
                 ogs_debug("[%s:%s] Rx PFCP report after Gy Final Unit Indication",
                           smf_ue->imsi_bcd, sess->session.name);
-                /* This effectively triggers session release: */
-                cause_value = OGS_PFCP_CAUSE_NO_RESOURCES_AVAILABLE;
+                release_session = true;
             }
             break;
         case -1:
             ogs_error("No Gy Diameter Peer");
-            cause_value = OGS_PFCP_CAUSE_NO_RESOURCES_AVAILABLE;
+            release_session = true;
             break;
         /* default: continue below */
         }
@@ -1893,5 +1957,5 @@ uint8_t smf_n4_handle_session_report_request(
                     0, 0));
         }
     }
-    return cause_value;
+    return release_session;
 }

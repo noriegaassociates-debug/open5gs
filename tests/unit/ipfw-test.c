@@ -30,8 +30,23 @@ static int compile(ogs_ipfw_rule_t *rule, const char *flow_description)
     return ogs_ipfw_compile_rule(rule, buf);
 }
 
+static void reject(abts_case *tc, ogs_ipfw_rule_t *rule,
+        const char *flow_description, int lineno)
+{
+    int rv;
+    int id = ogs_log_get_domain_id("core");
+    ogs_log_level_e level = ogs_log_get_domain_level(id);
+
+    /* Suppress only the expected parser diagnostic, keeping FATAL visible. */
+    if (level >= OGS_LOG_ERROR && level < OGS_LOG_DEBUG)
+        ogs_log_set_domain_level(id, OGS_LOG_FATAL);
+    rv = compile(rule, flow_description);
+    ogs_log_set_domain_level(id, level);
+    abts_int_equal(tc, OGS_ERROR, rv, lineno);
+}
+
 #define ACCEPT(tc, s) ABTS_INT_EQUAL(tc, OGS_OK, compile(&rule, s))
-#define REJECT(tc, s) ABTS_INT_EQUAL(tc, OGS_ERROR, compile(&rule, s))
+#define REJECT(tc, s) reject(tc, &rule, s, __LINE__)
 
 /*
  * A rule that compiles can still mean something other than what was
@@ -167,6 +182,13 @@ static void ipfw_test_port(abts_case *tc, void *data)
     REJECT(tc, "permit out udp from 1.2.3.4 to assigned 0");
 
     REJECT(tc, "permit out udp from 1.2.3.4 65536 to assigned");
+
+    /* fill_newports() reads a leading zero as octal */
+    REJECT(tc, "permit out udp from 1.2.3.4 010 to assigned");
+    REJECT(tc, "permit out udp from 1.2.3.4 08 to assigned");
+    REJECT(tc, "permit out udp from 1.2.3.4 1-010 to assigned");
+    REJECT(tc, "permit out udp from 1.2.3.4 to assigned 0443");
+
     /* fill_newports() never compares the two ends of a range */
     REJECT(tc, "permit out udp from 1.2.3.4 50000-40000 to assigned");
     REJECT(tc, "permit out udp from 1.2.3.4 1-0 to assigned");
@@ -243,18 +265,7 @@ static void ipfw_test_assigned(abts_case *tc, void *data)
 
 abts_suite *test_ipfw(abts_suite *suite)
 {
-    int id = ogs_log_get_domain_id("core");
-    ogs_log_level_e level = ogs_log_get_domain_level(id);
-
     suite = ADD_SUITE(suite)
-
-    /*
-     * These cases feed malformed input to the parser to prove that it
-     * neither crashes (SEGV, exit) nor accepts the rule.  Only the return
-     * value matters here, so the diagnostic each rejection prints is not
-     * wanted -- silence the domain while the suite runs.
-     */
-    ogs_log_set_domain_level(id, OGS_LOG_NONE);
 
     abts_run_test(suite, ipfw_test_accepted, NULL);
     abts_run_test(suite, ipfw_test_structure, NULL);
@@ -264,8 +275,6 @@ abts_suite *test_ipfw(abts_suite *suite)
     abts_run_test(suite, ipfw_test_family, NULL);
     abts_run_test(suite, ipfw_test_port_list, NULL);
     abts_run_test(suite, ipfw_test_assigned, NULL);
-
-    ogs_log_set_domain_level(id, level);
 
     return suite;
 }

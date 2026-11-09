@@ -672,6 +672,9 @@ static void test1_func(abts_case *tc, void *data)
     /* Wait for PCF-Discovery */
     ogs_msleep(100);
 
+    /* Offer 0x72 so the PCF must negotiate it down to 0x12. */
+    af_sess->policyauthorization_features |= 0x60;
+
     /* Send AF-Session : CREATE */
     memset(&af_param, 0, sizeof(af_param));
     af_param.med_type = OpenAPI_media_type_AUDIO;
@@ -721,6 +724,8 @@ static void test1_func(abts_case *tc, void *data)
 
     /* Wait for PDU session resource modify complete */
     ogs_msleep(100);
+
+    ABTS_INT_EQUAL(tc, 0x12, (int)af_sess->policyauthorization_features);
 
     /* Send GTP-U ICMP Packet */
     qos_flow = test_qos_flow_find_by_qfi(sess, 2);
@@ -4964,6 +4969,120 @@ static void test_issue4672_func(abts_case *tc, void *data)
     test_af_qos_reference_cleanup(tc, test_ue, ngap, gtpu);
 }
 
+static void test_arp_update_func(abts_case *tc, void *data)
+{
+    ogs_socknode_t *ngap = NULL;
+    ogs_socknode_t *gtpu = NULL;
+    test_ue_t *test_ue = NULL;
+    test_sess_t *sess = NULL;
+    test_bearer_t *qos_flow = NULL;
+    af_sess_t *af_sess = NULL;
+    af_npcf_policyauthorization_param_t af_param;
+    ogs_qos_t created;
+
+    /*
+     * AF-requested ARP over N5
+     *
+     * An update that carries only ARP must modify the QoS flow ARP
+     * and keep the bitrates negotiated on create. The resPrio here is
+     * not mapped in the PCF config, so only preemptCap/preemptVuln
+     * change while the priority level stays as provisioned in DB.
+     */
+    test_af_qos_reference_setup(tc, "0000004793",
+            &test_ue, &sess, &af_sess, &ngap, &gtpu);
+
+    /* Create with bandwidth : dedicated QoS flow(QFI 2) */
+    memset(&af_param, 0, sizeof(af_param));
+    af_param.med_type = OpenAPI_media_type_AUDIO;
+    af_param.qos_reference = "test-audio";
+    af_param.qos_type = 1;
+    af_param.flow_type = 99;
+
+    af_local_send_to_pcf(af_sess, &af_param,
+            af_npcf_policyauthorization_build_create);
+
+    qos_flow = test_af_complete_qos_flow_modify(tc, test_ue, sess, ngap);
+    ogs_assert(qos_flow);
+
+    /* ARP as provisioned in DB (priority 3, may pre-empt, pre-emptable) */
+    ABTS_INT_EQUAL(tc, 3, qos_flow->qos.arp.priority_level);
+    ABTS_INT_EQUAL(tc, OGS_5GC_PRE_EMPTION_ENABLED,
+            qos_flow->qos.arp.pre_emption_capability);
+    ABTS_INT_EQUAL(tc, OGS_5GC_PRE_EMPTION_ENABLED,
+            qos_flow->qos.arp.pre_emption_vulnerability);
+    ABTS_TRUE(tc, qos_flow->qos.mbr.downlink != 0);
+    ABTS_TRUE(tc, qos_flow->qos.gbr.uplink != 0);
+    created = qos_flow->qos;
+
+    /* Update with ARP only : unmapped resPrio + pre-emption off */
+    memset(&af_param, 0, sizeof(af_param));
+    af_param.med_type = OpenAPI_media_type_AUDIO;
+    af_param.qos_reference = "test-audio";
+    af_param.res_prio = OpenAPI_reserv_priority_PRIO_1;
+    af_param.preempt_cap = OpenAPI_preemption_capability_NOT_PREEMPT;
+    af_param.preempt_vuln = OpenAPI_preemption_vulnerability_NOT_PREEMPTABLE;
+
+    af_local_send_to_pcf(af_sess, &af_param,
+            af_npcf_policyauthorization_build_update_arp);
+
+    qos_flow = test_af_complete_qos_flow_modify(tc, test_ue, sess, ngap);
+    ogs_assert(qos_flow);
+
+    ABTS_INT_EQUAL(tc, 3, qos_flow->qos.arp.priority_level);
+    ABTS_INT_EQUAL(tc, OGS_5GC_PRE_EMPTION_DISABLED,
+            qos_flow->qos.arp.pre_emption_capability);
+    ABTS_INT_EQUAL(tc, OGS_5GC_PRE_EMPTION_DISABLED,
+            qos_flow->qos.arp.pre_emption_vulnerability);
+
+    /* Bitrates negotiated on create are kept */
+    ABTS_TRUE(tc, created.mbr.downlink == qos_flow->qos.mbr.downlink);
+    ABTS_TRUE(tc, created.mbr.uplink == qos_flow->qos.mbr.uplink);
+    ABTS_TRUE(tc, created.gbr.downlink == qos_flow->qos.gbr.downlink);
+    ABTS_TRUE(tc, created.gbr.uplink == qos_flow->qos.gbr.uplink);
+
+    test_af_qos_reference_delete(tc, test_ue, sess, af_sess, ngap);
+    test_af_qos_reference_cleanup(tc, test_ue, ngap, gtpu);
+}
+
+/*
+ * Issue #4899
+ * Subscription to Notification of Signalling Path Status (no medType)
+ * is accepted by create and update, and no QoS flow is added.
+ */
+static void test_issue4899_func(abts_case *tc, void *data)
+{
+    ogs_socknode_t *ngap = NULL;
+    ogs_socknode_t *gtpu = NULL;
+    test_ue_t *test_ue = NULL;
+    test_sess_t *sess = NULL;
+    af_sess_t *af_sess = NULL;
+
+    test_af_qos_reference_setup(tc, "0000004899",
+            &test_ue, &sess, &af_sess, &ngap, &gtpu);
+
+    af_local_send_to_pcf(af_sess, NULL,
+            af_npcf_policyauthorization_build_create_signalling);
+
+    ogs_msleep(100);
+    ABTS_INT_EQUAL(tc, OGS_SBI_HTTP_STATUS_CREATED,
+            af_sess->last_pcf_status);
+
+    af_local_send_to_pcf(af_sess, NULL,
+            af_npcf_policyauthorization_build_update_signalling);
+
+    ogs_msleep(100);
+    ABTS_INT_EQUAL(tc, OGS_SBI_HTTP_STATUS_OK, af_sess->last_pcf_status);
+
+    ABTS_TRUE(tc, test_qos_flow_find_by_qfi(sess, 2) == NULL);
+
+    af_local_send_to_pcf(af_sess, NULL,
+            af_npcf_policyauthorization_build_delete);
+
+    ogs_msleep(100);
+
+    test_af_qos_reference_cleanup(tc, test_ue, ngap, gtpu);
+}
+
 abts_suite *test_af(abts_suite *suite)
 {
     suite = ADD_SUITE(suite)
@@ -4989,6 +5108,8 @@ abts_suite *test_af(abts_suite *suite)
     abts_run_test(suite, test12_func, NULL);
     abts_run_test(suite, test13_func, NULL);
     abts_run_test(suite, test_issue4672_func, NULL);
+    abts_run_test(suite, test_arp_update_func, NULL);
+    abts_run_test(suite, test_issue4899_func, NULL);
 
     return suite;
 }
